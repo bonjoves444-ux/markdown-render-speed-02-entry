@@ -1,23 +1,14 @@
-// Driver for the markdown renderer: reads every case from the
-// input directory, renders each one on its own with parse(), and
-// writes the HTML strings out in the cases' order.
+// Entry point: render each case in cases.json to html.json.
+// Input and output directories come from the environment so the
+// same program works both locally and on the grading server.
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { parse } from "./parse.js";
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { parse } from './parse.js';
+const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input";
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const cases = JSON.parse(readFileSync(`${inputDir}/cases.json`, "utf8"));
+const html = cases.map((c) => parse(c.markdown));
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as {
-  id: string;
-  markdown: string;
-}[];
-
-const html: string[] = [];
-for (const c of cases) html.push(parse(c.markdown));
-
-// The output directory is a mount point in the harness: create it
-// only when it is missing, never remove or recreate it.
-mkdirSync(OUTPUT_DIR, { recursive: true });
-writeFileSync(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
+mkdirSync(outputDir, { recursive: true });
+writeFileSync(`${outputDir}/html.json`, JSON.stringify(html));
