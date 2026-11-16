@@ -1,161 +1,118 @@
-// parse.js — a credited fork of marked 18.1.3 (MIT) with fast paths.
+// parse.js — a credited fork of marked 18.1.3 (MIT).
 //
-// The vendored stock marked lives under vendor/marked/ (marked.esm.js with
-// its LICENSE and NOTICE intact). This file imports the stock Lexer, Parser
-// and Tokenizer and overrides only the hot paths:
-//   - a FastLexer that tokenizes inline content with a character-dispatched
-//     scanner instead of re-running the stock inline regexes per token;
-//   - a FastTokenizer that gates each block rule behind a cheap necessary
-//     condition and ports the list rule to a manual string walk.
-// Everything else delegates to stock marked, so output is byte-identical
-// to marked 18.1.3 on every input we have tested.
+// Renders Markdown to exactly the HTML marked 18.1.3 produces with its
+// default options (GFM on). The stock Lexer and Parser from vendor/marked/
+// do the real work; only the block Tokenizer is replaced with a faster one.
+// Cheap first-character gates skip the block regexes that cannot match, and
+// the list tokenizer is a manual port of the stock one that avoids splitting
+// the source into lines. The inline tokenizer is the stock one, untouched,
+// so autolinks, hard breaks and emphasis behave exactly like marked.
 //
-// parse() is stateless across calls: no memo, no cache, nothing written to
-// disk, no table keyed on input text or hash. Deterministic, Node 22
-// erasable-TS only, Node built-ins plus this file's own source.
+// SPDX-License-Identifier: MIT
 
 import { Lexer, Parser, Tokenizer, marked } from "./vendor/marked/marked.esm.js";
 
-// ---- character classification -------------------------------------------
-// ASCII_KIND maps each ASCII code to a small integer kind used by the
-// inline scanner to decide, in O(1), whether a character can start markup.
-// 0 = ordinary, 1 = backtick, 2 = tilde, 3 = asterisk, 4 = underscore,
-// 5 = bracket, 6 = bang, 7 = less-than, 8 = backslash, 9 = whitespace/newline,
-// 10 = other punctuation.
+// --- Character kinds -------------------------------------------------------
+// Small integer kinds for the ASCII characters that can start a block
+// token. kindAt() classifies the character at an index; anything else
+// (including every non-ASCII code point) is kind 0, "other", because no
+// block token in marked starts with it.
+
 const ASCII_KIND = new Uint8Array(128);
-for (let i = 0; i < 128; i++) {
-  const c = String.fromCharCode(i);
-  if (c === "`") ASCII_KIND[i] = 1;
-  else if (c === "~") ASCII_KIND[i] = 2;
-  else if (c === "*") ASCII_KIND[i] = 3;
-  else if (c === "_") ASCII_KIND[i] = 4;
-  else if (c === "[") ASCII_KIND[i] = 5;
-  else if (c === "!") ASCII_KIND[i] = 6;
-  else if (c === "<") ASCII_KIND[i] = 7;
-  else if (c === "\\") ASCII_KIND[i] = 8;
-  else if (c === " " || c === "\t" || c === "\n" || c === "\r") ASCII_KIND[i] = 9;
-  else if (/[^a-zA-Z0-9]/.test(c)) ASCII_KIND[i] = 10;
+{
+  const set = (chars, kind) => {
+    for (const ch of chars) ASCII_KIND[ch.charCodeAt(0)] = kind;
+  };
+  set(" ", 1);
+  set("\t", 2);
+  set("\n", 3);
+  set("#", 4);
+  set(">", 5);
+  set("`", 6);
+  set("~", 7);
+  set("-", 8);
+  set("*", 9);
+  set("_", 10);
+  set("+", 11);
+  set("[", 12);
+  set("<", 13);
+  set("0123456789", 14);
+  set("|", 15);
+  set("=", 16);
+  set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 17);
+  set(":", 18);
+  set(".", 19);
+  set("/", 20);
+  set("!", 21);
+  set("?", 22);
+  set("\r", 23);
 }
-function kindAt(src, i) {
-  const code = src.charCodeAt(i);
-  return code < 128 ? ASCII_KIND[code] : 0;
+
+function codePointAt(s, i) {
+  if (i >= s.length) return -1;
+  const hi = s.charCodeAt(i);
+  if (hi >= 0xd800 && hi <= 0xdbff && i + 1 < s.length) {
+    const lo = s.charCodeAt(i + 1);
+    if (lo >= 0xdc00 && lo <= 0xdfff) return 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
+  }
+  return hi;
 }
-function codePointAt(src, i) {
-  return src.codePointAt(i);
+
+function codePointLen(s, i) {
+  if (i >= s.length) return 0;
+  const hi = s.charCodeAt(i);
+  if (hi >= 0xd800 && hi <= 0xdbff && i + 1 < s.length) {
+    const lo = s.charCodeAt(i + 1);
+    if (lo >= 0xdc00 && lo <= 0xdfff) return 2;
+  }
+  return 1;
 }
-function codePointLen(src, i) {
-  const cp = src.codePointAt(i);
-  return cp > 0xffff ? 2 : 1;
+
+function kindAt(s, i) {
+  if (i >= s.length) return 0;
+  const cp = codePointAt(s, i);
+  return cp < 128 ? ASCII_KIND[cp] : 0;
 }
+
 function isPunctStr(s) {
-  if (!s) return false;
-  for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    if (code < 128) {
-      if (ASCII_KIND[code] !== 10 && ASCII_KIND[code] !== 0) {
-        // punctuation kinds 1-8 and 10 count; letters/digits do not
-        if (ASCII_KIND[code] >= 1 && ASCII_KIND[code] <= 8) continue;
-        if (ASCII_KIND[code] === 10) continue;
-        return false;
-      }
-      if (/[a-zA-Z0-9]/.test(s[i])) return false;
-    } else if (/[\p{L}\p{N}]/u.test(s[i])) return false;
+  if (s.length === 0) return false;
+  for (let i = 0; i < s.length; i += codePointLen(s, i)) {
+    if (!/[\p{P}\p{S}]/u.test(String.fromCodePoint(codePointAt(s, i)))) return false;
   }
   return true;
 }
 
-// ---- entity decoding (stock Ie replica) ---------------------------------
-// Decodes numeric character references the way marked's inline text does.
-const numericCharacterReference = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
-const numericCharacterReferenceOrAmpersand = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+// --- Stock entity decoding and label normalisation -------------------------
+// Replicas of the stock helpers (named Ie and F in the vendored build):
+// a numeric character reference that is 0, over U+10FFFF, or a surrogate
+// becomes U+FFFD; 38 becomes &amp;; a bare & that is not the start of a
+// reference becomes &amp;; anything else is left alone.
+
+const NUMERIC_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
+const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+
 function decodeEntities(s) {
-  if (!numericCharacterReference.test(s)) return s;
-  return s.replace(numericCharacterReferenceOrAmpersand, (m, dec, hex) => {
-    if (m[0] === "&" && m[1] !== "#") return "&amp;";
-    const n = dec ? parseInt(dec, 10) : parseInt(hex, 16);
-    if (!n || n > 1114111 || (n >= 55296 && n <= 57343)) return "\uFFFD";
-    if (n === 38) return "&amp;";
-    return String.fromCodePoint(n);
+  if (!NUMERIC_REF.test(s)) return s;
+  return s.replace(NUMERIC_REF_OR_AMP, (match, dec, hex) => {
+    if (dec === undefined && hex === undefined) return "&amp;";
+    const cp = dec === undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
+    if (cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return "\uFFFD";
+    if (cp === 38) return "&amp;";
+    return String.fromCodePoint(cp);
   });
 }
 
-// Normalizes a link reference label: collapse whitespace, lowercase.
-function normLabel(label) {
-  return label.replace(/\s+/g, " ").trim().toLowerCase();
+const MULTIPLE_SPACE = /\s+/g;
+
+function normLabel(s) {
+  return s.trim().replace(MULTIPLE_SPACE, " ").toLowerCase().toUpperCase().toLowerCase();
 }
 
-// ---- line helpers --------------------------------------------------------
-function lineEnd(src, i) {
-  const n = src.indexOf("\n", i);
-  return n === -1 ? src.length : n;
-}
-// Expands tabs column-wise (a tab advances the column to the next multiple
-// of 4) and returns the column of the first non-space character.
-function firstNonSpaceExpanded4(m) {
-  let col = 0;
-  for (let i = 0; i < m.length; i++) {
-    if (m[i] === "\t") col = (Math.floor(col / 4) + 1) * 4;
-    else if (m[i] === " ") col++;
-    else return col;
-  }
-  return col;
-}
-function expandTabs(line) {
-  // Returns the line with tabs expanded to spaces by column (tab = next
-  // multiple of 4). Used only for the list inner walk.
-  let out = "";
-  let col = 0;
-  for (let i = 0; i < line.length; i++) {
-    if (line[i] === "\t") {
-      const next = (Math.floor(col / 4) + 1) * 4;
-      out += " ".repeat(next - col);
-      col = next;
-    } else {
-      out += line[i];
-      col++;
-    }
-  }
-  return out;
-}
-const SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
-function isUnderlineRow(line) {
-  return SETEXT_LINE.test(line);
-}
-function blankLineRange(src, i) {
-  // If the line starting at i is blank (only spaces/tabs), returns its end
-  // (index just past the newline); else -1.
-  let j = i;
-  while (j < src.length && (src[j] === " " || src[j] === "\t")) j++;
-  if (j >= src.length) return src.length;
-  if (src[j] === "\n") return j + 1;
-  if (src[j] === "\r" && src[j + 1] === "\n") return j + 2;
-  return -1;
-}
-function lineIsHr(line) {
-  return /^ {0,3}((?:\* *){3,}|(?:- *){3,}|(?:_ *){3,})$/.test(line);
-}
-function lineIsFences(line) {
-  return /^ {0,3}(`{3,}|~{3,})/.test(line);
-}
-function lineIsHeading(line) {
-  return /^ {0,3}#{1,6}(?:[ \t]+|$)/.test(line);
-}
-function lineIsBlockquote(line) {
-  return /^ {0,3}>/.test(line);
-}
-function lineIsHtml(line) {
-  return /^ {0,3}<\/?(?:[A-Za-z][A-Za-z0-9-]*)/.test(line);
-}
-function blankLineText(line) {
-  return /^[ \t]*$/.test(line);
-}
-function endsWithDoubleBlank(s) {
-  return /\n[ \t]*\n[ \t]*$/.test(s) || /^[ \t]*\n[ \t]*$/.test(s);
-}
+// --- Stock tab expansion ---------------------------------------------------
+// J(s, startCol): expand tabs to spaces, a tab jumping to the next multiple
+// of 4 columns from startCol. Verbatim from the stock build. It takes the
+// column the run starts at and does NOT pad to a target width.
 
-// J expands a leading run of spaces/tabs to spaces. The second argument is
-// the column at which the run starts (default 0); a tab advances the column
-// to the next multiple of 4. This is the stock marked helper, verbatim.
 function J(s, startCol = 0) {
   let col = startCol;
   let out = "";
@@ -172,253 +129,402 @@ function J(s, startCol = 0) {
   return out;
 }
 
-// ---- FastTokenizer --------------------------------------------------------
-// Extends the stock Tokenizer. Each block rule is gated behind a cheap
-// necessary condition (first character / short prefix test) so the stock
-// regex only runs when the input could possibly match. Lists go through
-// listPort, a manual port of the stock list() that avoids per-line regexes.
-const BLOCK_TAG_SET = new Set([
-  "address","article","aside","base","basefont","blockquote","body","caption",
-  "center","col","colgroup","dd","details","dialog","dir","div","dl","dt",
-  "fieldset","figcaption","figure","footer","form","frame","frameset","h1",
-  "h2","h3","h4","h5","h6","head","header","hr","html","iframe","legend",
-  "li","link","main","menu","menuitem","nav","noframes","ol","optgroup",
-  "option","p","param","search","section","summary","table","tbody","td",
-  "tfoot","th","thead","title","tr","track","ul"
-]);
+function expandTabs(s, startCol = 0) {
+  return J(s, startCol);
+}
+
+// --- Line helpers ----------------------------------------------------------
+
+function lineEnd(src, from = 0) {
+  const i = src.indexOf("\n", from);
+  return i === -1 ? src.length : i;
+}
+
+function firstLine(src) {
+  return src.slice(0, lineEnd(src, 0));
+}
+
+// Column (tabs expanded to the next multiple of 4) and index of the first
+// character that is not a space or a tab.
+function firstNonSpaceExpanded4(src) {
+  let col = 0;
+  let idx = 0;
+  while (idx < src.length) {
+    const ch = src[idx];
+    if (ch === " ") {
+      col++;
+      idx++;
+    } else if (ch === "\t") {
+      col += 4 - (col % 4);
+      idx++;
+    } else break;
+  }
+  return { col, idx };
+}
+
+function blankLineText(line) {
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== " " && line[i] !== "\t") return false;
+  }
+  return true;
+}
+
+// Index just past the run of blank lines starting at `from`.
+function blankLineRange(src, from = 0) {
+  let pos = from;
+  while (pos < src.length) {
+    const end = lineEnd(src, pos);
+    if (!blankLineText(src.slice(pos, end))) break;
+    pos = end + 1;
+  }
+  return pos;
+}
+
+const SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
+
+function isUnderlineRow(line) {
+  return SETEXT_LINE.test(line);
+}
+
+function endsWithDoubleBlank(s) {
+  return /\n[ \t]*\n[ \t]*$/.test(s);
+}
+
+// The stock HTML block tag names, verbatim from the vendored build.
+const BLOCK_TAG_SET = new Set(
+  "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul".split("|")
+);
+
+// Index just after up to three leading spaces (the stock block regexes
+// allow at most three; a tab is not a leading space here).
+function skipUpTo3Spaces(src) {
+  let i = 0;
+  while (i < src.length && i < 3 && src[i] === " ") i++;
+  return i;
+}
+
+function isAsciiLetter(ch) {
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z");
+}
+
+// Each lineIs* helper is a necessary condition for its stock regex: it
+// passes whenever the stock method could match, and only skips the super
+// call when the stock method certainly cannot match.
+
+function lineIsFences(src) {
+  const k = kindAt(src, skipUpTo3Spaces(src));
+  return k === 6 || k === 7;
+}
+
+function lineIsHeading(src) {
+  return kindAt(src, skipUpTo3Spaces(src)) === 4;
+}
+
+function lineIsHr(src) {
+  const k = kindAt(src, skipUpTo3Spaces(src));
+  return k === 8 || k === 9 || k === 10;
+}
+
+function lineIsBlockquote(src) {
+  return kindAt(src, skipUpTo3Spaces(src)) === 5;
+}
+
+function lineIsHtml(src) {
+  const i = skipUpTo3Spaces(src);
+  if (src[i] !== "<") return false;
+  const c = src[i + 1];
+  if (c === "!" || c === "?") return true;
+  if (c === "/") return isAsciiLetter(src[i + 2]);
+  if (!isAsciiLetter(c)) return false;
+  // A letter tag. The stock html rule accepts any tag name in its later
+  // alternatives, so any letter tag is a possible html block; the
+  // block-tag set below names the tags its first alternative lists.
+  let j = i + 1;
+  let name = "";
+  while (j < src.length && /[a-zA-Z0-9-]/.test(src[j])) {
+    name += src[j];
+    j++;
+  }
+  // Known block tags are the common case; any other tag name passes too.
+  return BLOCK_TAG_SET.has(name.toLowerCase()) || name.length > 0;
+}
+
+function lineIsDef(src) {
+  return kindAt(src, skipUpTo3Spaces(src)) === 12;
+}
+
+function lineIsList(src) {
+  const k = kindAt(src, skipUpTo3Spaces(src));
+  return k === 8 || k === 9 || k === 11 || k === 14;
+}
+
+// A table can start here only if the second line is a delimiter row and
+// that row contains a colon or a pipe. (The stock table() also requires
+// the delimiter to contain : or |, and a pipe-less header is a real table
+// when the delimiter is like ":---" — so the header need not contain a
+// pipe. The delimiter pattern and the :/| test are both necessary
+// conditions for the stock method to match.)
+const DELIM_ROW = /^ {0,3}(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/;
 
 function tableStartsHere(src) {
-  // True if src begins a GFM table: a header row containing | followed by
-  // a delimiter row. Cheap necessary checks before the stock regex.
   const nl = src.indexOf("\n");
   if (nl === -1) return false;
-  const first = src.slice(0, nl);
-  if (!first.includes("|")) return false;
-  const secondEnd = src.indexOf("\n", nl + 1);
-  const second = secondEnd === -1 ? src.slice(nl + 1) : src.slice(nl + 1, secondEnd);
-  return /^ {0,3}\|? *:?-{1,} *:? *(?:\| *:?-{1,} *:? *)*\|? *$/.test(second);
+  const row = src.slice(nl + 1, lineEnd(src, nl + 1));
+  if (!DELIM_ROW.test(row)) return false;
+  return row.indexOf(":") !== -1 || row.indexOf("|") !== -1;
 }
+
+// True if some line after the first, before any blank line, is a setext
+// underline row. A setext heading needs such a row, so this is a
+// necessary condition for the stock lheading method to match.
 function setextRowAhead(src) {
-  // True if any following line (until a blank line or end of input) is a
-  // setext underline row. Used to gate the lheading rule.
-  let i = 0;
-  while (i < src.length) {
-    const end = lineEnd(src, i);
-    const line = src.slice(i, end);
+  let pos = src.indexOf("\n");
+  if (pos === -1) return false;
+  pos++;
+  while (pos < src.length) {
+    const end = lineEnd(src, pos);
+    const line = src.slice(pos, end);
     if (blankLineText(line)) return false;
     if (isUnderlineRow(line)) return true;
-    i = end + 1;
+    pos = end + 1;
   }
   return false;
 }
 
+// --- Fast block tokenizer --------------------------------------------------
+// Same tokens as the stock Tokenizer; each method first checks a cheap
+// necessary condition and only then runs the stock regex. A gate that
+// passes when the stock method would fail costs one wasted super call;
+// a gate that fails when the stock method would match would be a bug,
+// so every gate below is a necessary condition for its regex.
+
 class FastTokenizer extends Tokenizer {
   space(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 10 && c !== 13) return undefined;
-    return super.space(src);
-  }
-  code(src) {
-    // Indented code needs the first non-space character at column >= 4,
-    // counting a tab as advancing to the next multiple of 4.
-    let col = 0;
-    let i = 0;
-    while (i < src.length && (src[i] === " " || src[i] === "\t")) {
-      if (src[i] === "\t") col = (Math.floor(col / 4) + 1) * 4;
-      else col++;
-      i++;
-    }
-    if (col < 4) return undefined;
-    return super.code(src);
-  }
-  fences(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 96 && c !== 126) return undefined;
-    return super.fences(src);
-  }
-  heading(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 35) return undefined;
-    return super.heading(src);
-  }
-  hr(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 42 && c !== 45 && c !== 95) return undefined;
-    return super.hr(src);
-  }
-  blockquote(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 62) return undefined;
-    return super.blockquote(src);
-  }
-  html(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 9 && c !== 60) return undefined;
-    return super.html(src);
-  }
-  def(src) {
-    // A link definition may have up to 3 leading spaces before '['.
-    let i = 0;
-    while (i < 3 && src.charCodeAt(i) === 32) i++;
-    if (src.charCodeAt(i) !== 91) return undefined;
-    return super.def(src);
-  }
-  table(src) {
-    if (!tableStartsHere(src)) return undefined;
-    return super.table(src);
-  }
-  lheading(src) {
-    if (!setextRowAhead(src)) return undefined;
-    return super.lheading(src);
-  }
-  list(src) {
-    if (this.options.pedantic) return super.list(src);
-    return this.listPort(src);
+    const k = kindAt(src, 0);
+    if (k === 1 || k === 2 || k === 3) return super.space(src);
   }
 
-  // listPort: a manual port of the stock Tokenizer.list(). Phase 1 walks
-  // the item lines with indexOf scans (no per-line regexes); phase 2
-  // tokenizes each item's text through the stock block lexer and applies
-  // the stock task-checkbox handling verbatim.
+  code(src) {
+    // Indented code: the first line must reach column 4 (a tab jumps to
+    // the next multiple of 4) and have a non-newline character after it.
+    const { col, idx } = firstNonSpaceExpanded4(src);
+    if (col < 4) return;
+    if (idx >= src.length || src[idx] === "\n") return;
+    return super.code(src);
+  }
+
+  fences(src) {
+    if (lineIsFences(src)) return super.fences(src);
+  }
+
+  heading(src) {
+    if (lineIsHeading(src)) return super.heading(src);
+  }
+
+  hr(src) {
+    if (lineIsHr(src)) return super.hr(src);
+  }
+
+  blockquote(src) {
+    if (lineIsBlockquote(src)) return super.blockquote(src);
+  }
+
+  html(src) {
+    if (lineIsHtml(src)) return super.html(src);
+  }
+
+  def(src) {
+    if (lineIsDef(src)) return super.def(src);
+  }
+
+  table(src) {
+    if (tableStartsHere(src)) return super.table(src);
+  }
+
+  lheading(src) {
+    if (setextRowAhead(src)) return super.lheading(src);
+  }
+
+  list(src) {
+    if (this.options.pedantic) return super.list(src);
+    if (lineIsList(src)) return this.listPort(src);
+  }
+
+  // Manual port of the stock Tokenizer.list(), written to avoid splitting
+  // the source into lines: firstLine() uses indexOf("\n") instead of
+  // split("\n", 1)[0]. Semantics follow the stock method line by line.
   listPort(src) {
-    const cap = this.rules.block.list.exec(src);
-    if (!cap) return undefined;
-    const orig = src;
-    let e = src;
-    const consumed = () => orig.length - e.length;
-    const firstLine = (s) => {
-      const i = s.indexOf("\n");
-      return i === -1 ? s : s.slice(0, i);
-    };
+    let cap = this.rules.block.list.exec(src);
+    if (!cap) return;
+    const start = src;
+    const pos = () => start.length - src.length;
     const bull = cap[1].trim();
     const ordered = bull.length > 1;
-    const listTok = {
-      type: "list", raw: "", ordered,
+    const list = {
+      type: "list",
+      raw: "",
+      ordered,
       start: ordered ? +bull.slice(0, -1) : "",
-      loose: false, items: []
+      loose: false,
+      items: [],
     };
-    const bullRe = ordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
-    const itemRe = this.rules.other.listItemRegex(bullRe);
-    let p = false;
-    while (e) {
-      let u = false;
-      let d = "";
-      const t = itemRe.exec(e);
-      if (!t || this.rules.block.hr.test(e)) break;
-      const k = consumed();
-      e = e.substring(t[0].length);
-      const g = firstLine(t[2]);
-      const b = t[1].length;
-      let m = g.replace(this.rules.other.leadingSpaceTab, (v) => J(v, b));
-      let f = firstLine(e);
-      const y0 = !m.trim();
-      let y = y0;
-      let R = 0;
-      if (y) {
-        R = b + 1;
+    let bullRegex = ordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
+    if (this.options.pedantic) bullRegex = ordered ? bullRegex : "[*+-]";
+    const itemRegex = this.rules.other.listItemRegex(bullRegex);
+    let sawDoubleBlank = false;
+    for (; src;) {
+      let isEnd = false;
+      let text = "";
+      if (!(cap = itemRegex.exec(src)) || this.rules.block.hr.test(src)) break;
+      const itemStart = pos();
+      src = src.substring(cap[0].length);
+      const first = firstLine(cap[2]);
+      const bulletLen = cap[1].length;
+      let content = this.options.pedantic
+        ? J(first, bulletLen)
+        : first.replace(this.rules.other.leadingSpaceTab, (v) => J(v, bulletLen));
+      let nextLine = firstLine(src);
+      let isEmpty = !content.trim();
+      let indent = 0;
+      if (this.options.pedantic) {
+        indent = 2;
+        text = content.trimStart();
+      } else if (isEmpty) {
+        indent = bulletLen + 1;
       } else {
-        R = m.search(this.rules.other.nonSpaceChar);
-        R = R > 4 ? 1 : R;
-        d = m.slice(R);
-        R += b;
+        indent = content.search(this.rules.other.nonSpaceChar);
+        if (indent > 4) indent = 1;
+        text = content.slice(indent);
+        indent += bulletLen;
       }
-      if (y && this.rules.other.blankLine.test(f)) {
-        e = e.substring(f.length + 1);
-        u = true;
+      if (isEmpty && this.rules.other.blankLine.test(nextLine)) {
+        src = src.substring(nextLine.length + 1);
+        isEnd = true;
       }
-      if (!u) {
-        const v = this.rules.other.nextBulletRegex(R);
-        const Q = this.rules.other.hrRegex(R);
-        const ee = this.rules.other.fencesBeginRegex(R);
-        const te = this.rules.other.headingBeginRegex(R);
-        const M = this.rules.other.htmlBeginRegex(R);
-        const ne = this.rules.other.blockquoteBeginRegex(R);
-        while (e) {
-          const U = firstLine(e);
-          let Z;
-          f = U;
-          Z = f.replace(this.rules.other.leadingSpaceTab, (me) => J(me));
-          if (ee.test(f) || te.test(f) || M.test(f) || ne.test(f) || v.test(f) || Q.test(f)) break;
-          if (Z.search(this.rules.other.nonSpaceChar) >= R || !f.trim()) {
-            d += "\n" + Z.slice(R);
+      if (!isEnd) {
+        const nextBullet = this.rules.other.nextBulletRegex(indent);
+        const hr = this.rules.other.hrRegex(indent);
+        const fences = this.rules.other.fencesBeginRegex(indent);
+        const heading = this.options.pedantic
+          ? this.rules.other.pedanticHeadingBeginRegex(indent)
+          : this.rules.other.headingBeginRegex(indent);
+        const html = this.rules.other.htmlBeginRegex(indent);
+        const blockquote = this.rules.other.blockquoteBeginRegex(indent);
+        for (; src;) {
+          const line = firstLine(src);
+          let lineExpanded;
+          nextLine = line;
+          if (this.options.pedantic) {
+            nextLine = nextLine.replace(this.rules.other.listReplaceNesting, "  ");
+            lineExpanded = nextLine;
           } else {
-            if (y || m.replace(this.rules.other.tabCharGlobal, "    ").search(this.rules.other.nonSpaceChar) >= 4 || ee.test(m) || te.test(m) || M.test(m) || Q.test(m)) break;
-            const qe = /^ {0,3}(?:=+|-+) *$/.test(f) && this.rules.block.lheading.test(`${m}\n${f}`)
-              ? `    ${Z.replace(/^ {0,3}/, "")}` : f;
-            d += "\n" + qe;
+            lineExpanded = nextLine.replace(this.rules.other.leadingSpaceTab, (m) => J(m));
           }
-          y = !f.trim();
-          e = e.substring(U.length + 1);
-          m = Z.slice(R);
+          if (
+            fences.test(nextLine) || heading.test(nextLine) || html.test(nextLine) ||
+            blockquote.test(nextLine) || nextBullet.test(nextLine) || hr.test(nextLine)
+          ) break;
+          if (lineExpanded.search(this.rules.other.nonSpaceChar) >= indent || !nextLine.trim()) {
+            text += "\n" + lineExpanded.slice(indent);
+          } else {
+            if (
+              isEmpty ||
+              content.replace(this.rules.other.tabCharGlobal, "    ").search(this.rules.other.nonSpaceChar) >= 4 ||
+              fences.test(content) || heading.test(content) || html.test(content) || hr.test(content)
+            ) break;
+            const setext =
+              !this.options.pedantic &&
+              SETEXT_LINE.test(nextLine) &&
+              this.rules.block.lheading.test(`${content}\n${nextLine}`)
+                ? `    ${lineExpanded.replace(/^ {0,3}/, "")}`
+                : nextLine;
+            text += "\n" + setext;
+          }
+          isEmpty = !nextLine.trim();
+          src = src.substring(line.length + 1);
+          content = lineExpanded.slice(indent);
         }
       }
-      const A = orig.slice(k, consumed());
-      if (!listTok.loose) {
-        if (p) listTok.loose = true;
-        else if (this.rules.other.doubleBlankLine.test(A)) p = true;
+      const itemRaw = start.slice(itemStart, pos());
+      if (!list.loose) {
+        if (sawDoubleBlank) list.loose = true;
+        else if (endsWithDoubleBlank(itemRaw)) sawDoubleBlank = true;
       }
-      listTok.items.push({
-        type: "list_item", raw: A,
-        task: !!this.options.gfm && this.rules.other.listIsTask.test(d),
-        loose: false, text: d, tokens: []
+      list.items.push({
+        type: "list_item",
+        raw: itemRaw,
+        task: !!this.options.gfm && this.rules.other.listIsTask.test(text),
+        loose: false,
+        text,
+        tokens: [],
       });
     }
-    const h = listTok.items.at(-1);
-    if (h) { h.raw = h.raw.trimEnd(); h.text = h.text.trimEnd(); }
-    else return undefined;
-    listTok.raw = orig.slice(0, consumed()).trimEnd();
-    for (const u of listTok.items) {
+    const last = list.items.at(-1);
+    if (last) {
+      last.raw = last.raw.trimEnd();
+      last.text = last.text.trimEnd();
+    } else return;
+    list.raw = start.slice(0, pos()).trimEnd();
+    for (const item of list.items) {
       this.lexer.state.top = false;
-      u.tokens = this.lexer.blockTokens(u.text, []);
-      if (!listTok.loose) {
-        const dd = u.tokens.filter((g) => g.type === "space");
-        const kk = dd.length > 0 && dd.some((g) => this.rules.other.anyLine.test(g.raw));
-        listTok.loose = kk;
+      item.tokens = this.lexer.blockTokens(item.text, []);
+      if (!list.loose) {
+        const spaces = item.tokens.filter((t) => t.type === "space");
+        const hasLine = spaces.length > 0 && spaces.some((t) => this.rules.other.anyLine.test(t.raw));
+        list.loose = hasLine;
       }
     }
-    for (const u of listTok.items) {
-      const d = u.tokens[0];
-      if (u.task && (d?.type === "text" || d?.type === "paragraph")) {
-        u.text = u.text.replace(this.rules.other.listReplaceTask, "");
-        d.raw = d.raw.replace(this.rules.other.listReplaceTask, "");
-        d.text = d.text.replace(this.rules.other.listReplaceTask, "");
-        for (let g = this.lexer.inlineQueue.length - 1; g >= 0; g--) {
-          if (this.rules.other.listIsTask.test(this.lexer.inlineQueue[g].src)) {
-            this.lexer.inlineQueue[g].src = this.lexer.inlineQueue[g].src.replace(this.rules.other.listReplaceTask, "");
+    for (const item of list.items) {
+      const firstTok = item.tokens[0];
+      if (item.task && (firstTok?.type === "text" || firstTok?.type === "paragraph")) {
+        item.text = item.text.replace(this.rules.other.listReplaceTask, "");
+        firstTok.raw = firstTok.raw.replace(this.rules.other.listReplaceTask, "");
+        firstTok.text = firstTok.text.replace(this.rules.other.listReplaceTask, "");
+        for (let i = this.lexer.inlineQueue.length - 1; i >= 0; i--) {
+          if (this.rules.other.listIsTask.test(this.lexer.inlineQueue[i].src)) {
+            this.lexer.inlineQueue[i].src = this.lexer.inlineQueue[i].src.replace(this.rules.other.listReplaceTask, "");
             break;
           }
         }
-        const kk = this.rules.other.listTaskCheckbox.exec(u.raw);
-        if (kk) {
-          const g = { type: "checkbox", raw: kk[0] + " ", checked: kk[0] !== "[ ]" };
-          u.checked = g.checked;
-          if (listTok.loose) {
-            if (u.tokens[0] && ["paragraph", "text"].includes(u.tokens[0].type) && "tokens" in u.tokens[0] && u.tokens[0].tokens) {
-              u.tokens[0].raw = g.raw + u.tokens[0].raw;
-              u.tokens[0].text = g.raw + u.tokens[0].text;
-              u.tokens[0].tokens.unshift(g);
+        const checkbox = this.rules.other.listTaskCheckbox.exec(item.raw);
+        if (checkbox) {
+          const cb = { type: "checkbox", raw: checkbox[0] + " ", checked: checkbox[0] !== "[ ]" };
+          item.checked = cb.checked;
+          if (list.loose) {
+            if (
+              item.tokens[0] &&
+              ["paragraph", "text"].includes(item.tokens[0].type) &&
+              "tokens" in item.tokens[0] &&
+              item.tokens[0].tokens
+            ) {
+              item.tokens[0].raw = cb.raw + item.tokens[0].raw;
+              item.tokens[0].text = cb.raw + item.tokens[0].text;
+              item.tokens[0].tokens.unshift(cb);
             } else {
-              u.tokens.unshift({ type: "paragraph", raw: g.raw, text: g.raw, tokens: [g] });
+              item.tokens.unshift({ type: "paragraph", raw: cb.raw, text: cb.raw, tokens: [cb] });
             }
           } else {
-            u.tokens.unshift(g);
+            item.tokens.unshift(cb);
           }
         }
-      } else if (u.task) {
-        u.task = false;
+      } else if (item.task) {
+        item.task = false;
       }
     }
-    if (listTok.loose) {
-      for (const u of listTok.items) {
-        u.loose = true;
-        for (const d of u.tokens) if (d.type === "text") d.type = "paragraph";
+    if (list.loose) {
+      for (const item of list.items) {
+        item.loose = true;
+        for (const tok of item.tokens) {
+          if (tok.type === "text") tok.type = "paragraph";
+        }
       }
     }
-    return listTok;
+    return list;
   }
 }
 
-// ---- entry point ----------------------------------------------------------
+// --- Entry point -----------------------------------------------------------
+
 const DEFAULTS = { async: false, breaks: false, gfm: true, pedantic: false };
 
 export function parse(markdown) {
